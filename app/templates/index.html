@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回执对账试跑 · 外存左连接</title>
+<style>
+  :root { color-scheme: light dark; --line:#8884; --accent:#2563eb; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+  .sub { opacity: .7; margin-top: 0; }
+  form { border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem; }
+  label { display: block; font-weight: 600; margin: .9rem 0 .3rem; }
+  input[type=file] { display: block; }
+  input[type=number] { width: 7rem; padding: .3rem .4rem; }
+  button { margin-top: 1.25rem; padding: .55rem 1.2rem; border-radius: 8px;
+           border: 0; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .hint { font-size: .85rem; opacity: .7; margin: .2rem 0 0; }
+  .panel { border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem; margin-top: 1.25rem; }
+  table.stats { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  table.stats td { padding: .25rem .4rem; border-bottom: 1px solid var(--line); }
+  table.stats td:first-child { opacity: .75; }
+  table.stats td:last-child { text-align: right; font-weight: 600; }
+  .state { font-weight: 700; }
+  .state.done { color: #15803d; }
+  .state.failed { color: #b91c1c; }
+  .error { color: #b91c1c; white-space: pre-wrap; }
+  a.download { display: inline-block; margin-top: .75rem; padding: .5rem 1rem;
+               background: #15803d; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; }
+  .peak { font-size: 1.5rem; font-weight: 700; }
+  progress { width: 100%; height: .7rem; }
+  .muted { opacity: .65; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>回执对账试跑</h1>
+<p class="sub">外存左连接：每条扣款配出全部匹配回执；查完全部回执仍无匹配时，回执行号留空。</p>
+
+<form id="run-form">
+  <label for="debit_csv">扣款 CSV（row_no, txn_id）</label>
+  <input id="debit_csv" name="debit_csv" type="file" accept=".csv,text/csv" required>
+
+  <label for="receipt_csv">支付回执 CSV（row_no, txn_id）</label>
+  <input id="receipt_csv" name="receipt_csv" type="file" accept=".csv,text/csv" required>
+
+  <label for="buffer_limit">算子同时缓存的输入记录上限（条，≥ {{ min_limit }}）</label>
+  <input id="buffer_limit" name="buffer_limit" type="number" min="{{ min_limit }}" step="1" value="{{ default_limit }}" required>
+  <p class="hint">单个交易号的回执超过该上限时，算子通过磁盘分桶流式比对，仍在该限额内跑完。</p>
+
+  <label for="fault_after_writes">临时盘故障注入（可选，写入 N 次后报错，留空为正常）</label>
+  <input id="fault_after_writes" name="fault_after_writes" type="number" min="0" step="1" placeholder="例如 3">
+  <p class="hint">用于验证写入失败时的报错与中间文件清理。</p>
+
+  <button id="submit-btn" type="submit">开始试跑</button>
+  <p id="form-error" class="error" role="alert"></p>
+</form>
+
+<section id="progress-panel" class="panel" hidden>
+  <p>任务 <code id="job-id"></code> · 状态 <span id="job-state" class="state"></span></p>
+  <progress id="bar" value="0" max="100"></progress>
+  <p class="muted" id="phase-text"></p>
+</section>
+
+<section id="result-panel" class="panel" hidden>
+  <p>实际缓存峰值</p>
+  <p class="peak"><span id="peak">0</span> <span class="muted">/ 上限 <span id="limit">0</span> 条</span>
+     <span id="peak-verdict" class="muted"></span></p>
+  <table class="stats" id="stats-table"></table>
+  <p id="result-note" class="muted"></p>
+  <p id="cleanup-note" class="muted"></p>
+  <a id="download" class="download" href="#" hidden>下载配对 CSV</a>
+  <p id="run-error" class="error"></p>
+</section>
+
+<script>
+const fmt = new Intl.NumberFormat('zh-CN');
+const $ = (id) => document.getElementById(id);
+
+const STAT_LABELS = [
+  ['buffer_limit', '缓存上限（条）'],
+  ['peak_cached_records', '实际缓存峰值（条）'],
+  ['debit_rows_read', '已读扣款行'],
+  ['receipt_rows_read', '已读回执行'],
+  ['empty_receipt_rows_skipped', '跳过的空交易号回执'],
+  ['intermediate_files_created', '中间文件数'],
+  ['intermediate_records_written', '中间记录数'],
+  ['output_rows', '结果行数'],
+  ['matched_debits', '配到回执的扣款'],
+  ['unmatched_debits', '无回执的扣款'],
+];
+
+function renderStats(snapshot) {
+  const stats = snapshot.stats || {};
+  const peak = stats.peak_cached_records ?? 0;
+  const cap = snapshot.limit ?? 0;
+  $('peak').textContent = fmt.format(peak);
+  $('limit').textContent = fmt.format(cap);
+  $('peak-verdict').textContent = peak > cap
+    ? '超限！'
+    : `未超过上限（用满 ${cap ? Math.round((peak / cap) * 100) : 0}%）`;
+  const table = $('stats-table');
+  table.textContent = '';
+  for (const [key, label] of STAT_LABELS) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td'); td1.textContent = label;
+    const td2 = document.createElement('td'); td2.textContent = fmt.format(stats[key] ?? 0);
+    tr.append(td1, td2); table.append(tr);
+  }
+}
+
+let timer = null;
+
+async function poll(jobId) {
+  const res = await fetch(`/api/jobs/${jobId}`, {cache: 'no-store'});
+  if (!res.ok) { throw new Error(`状态查询失败（HTTP ${res.status}）`); }
+  const snap = await res.json();
+  renderStats(snap);
+
+  $('job-state').textContent = snap.state;
+  $('job-state').className = 'state ' + snap.state;
+  $('phase-text').textContent = `阶段：${snap.stats.phase || '-'}`;
+
+  const total = (snap.stats.debit_rows_read || 0) + (snap.stats.receipt_rows_read || 0);
+  $('bar').value = snap.state === 'done' ? 100 : Math.min(95, total / 50);
+
+  $('result-note').textContent = snap.result_available
+    ? '结果 CSV 已完整写出并落盘，可以下载。'
+    : '结果未就绪。';
+  const cleaned = snap.stats.cleaned_up;
+  $('cleanup-note').textContent =
+    `本次遗留中间文件：${snap.temp_files_left} 个` +
+    (snap.state === 'failed'
+      ? (cleaned ? '（写入失败后已清理本次全部中间文件）' : '（清理未确认，请检查 /data）')
+      : '。');
+
+  const link = $('download');
+  if (snap.result_available) {
+    link.href = `/api/jobs/${jobId}/result`;
+    link.hidden = false;
+  } else {
+    link.hidden = true;
+  }
+
+  if (snap.state === 'failed') {
+    $('run-error').textContent = snap.error || '未知错误';
+  } else {
+    $('run-error').textContent = '';
+  }
+
+  if (snap.state === 'done' || snap.state === 'failed') {
+    clearInterval(timer); timer = null;
+    $('submit-btn').disabled = false;
+    $('progress-panel').hidden = false;
+    $('result-panel').hidden = false;
+  }
+}
+
+$('run-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('form-error').textContent = '';
+  $('run-error').textContent = '';
+  $('download').hidden = true;
+  $('submit-btn').disabled = true;
+
+  const body = new FormData();
+  const debit = $('debit_csv').files[0];
+  const receipt = $('receipt_csv').files[0];
+  if (!debit || !receipt) {
+    $('form-error').textContent = '请同时选择两份 CSV。';
+    $('submit-btn').disabled = false;
+    return;
+  }
+  body.append('debit_csv', debit);
+  body.append('receipt_csv', receipt);
+  body.append('buffer_limit', $('buffer_limit').value);
+  const fault = $('fault_after_writes').value.trim();
+  if (fault) body.append('fault_after_writes', fault);
+
+  try {
+    const res = await fetch('/api/jobs', {method: 'POST', body});
+    const snap = await res.json();
+    if (!res.ok) throw new Error(snap.error || `HTTP ${res.status}`);
+    $('job-id').textContent = snap.job_id;
+    $('progress-panel').hidden = false;
+    $('result-panel').hidden = false;
+    $('bar').value = 0;
+    renderStats(snap);
+    if (timer) clearInterval(timer);
+    timer = setInterval(() => { poll(snap.job_id).catch(showFatal); }, 700);
+    poll(snap.job_id).catch(showFatal);
+  } catch (err) {
+    $('form-error').textContent = err.message;
+    $('submit-btn').disabled = false;
+  }
+});
+
+function showFatal(err) {
+  if (timer) { clearInterval(timer); timer = null; }
+  $('form-error').textContent = err.message;
+  $('submit-btn').disabled = false;
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+services:
+  reconciler:
+    build: .
+    image: receipt-reconciler:dev
+    ports:
+      - "8000:8000"
+    environment:
+      RECON_DATA_DIR: /data
+      PORT: "8000"
+    volumes:
+      - recon-data:/data
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+volumes:
+  recon-data:
