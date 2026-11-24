@@ -143,14 +143,15 @@ def test_spill_failure_raises_and_cleans_everything(tmp_path):
 
 
 def test_spill_failure_during_output_write_cleans_up(tmp_path):
-    # 1 receipt bucket write, then the result file failures.
+    # Writes before the first emitted pair: 1 receipt bucket write + 1 seal
+    # manifest write, so failing at the 3rd write hits the result output.
     debit = write_csv(tmp_path / "debit.csv", [("1", "A")])
     receipts = write_csv(tmp_path / "receipts.csv", [("10", "A")])
     out = tmp_path / "out" / "result.csv"
     work = tmp_path / "work"
     with pytest.raises(ej.SpillWriteError):
         ej.reconcile(
-            debit, receipts, out, limit=2, work_root=work, fault_after_writes=1
+            debit, receipts, out, limit=2, work_root=work, fault_after_writes=2
         )
     assert not out.exists()
     assert not out.with_name(out.name + ".part").exists()
@@ -260,3 +261,111 @@ def test_tab_and_backslash_in_values_roundtrip_through_buckets(tmp_path):
         tmp=tmp_path,
     )
     assert read_result(out) == [("1", "10"), ("1", "12"), ("2", "11")]
+
+
+# ---------------------------------------------------------------------------
+# Integrity of the sealed spill store
+# ---------------------------------------------------------------------------
+
+def test_missing_bucket_fails_job_instead_of_blanking_receipt(tmp_path):
+    """Without the seal a lost bucket would look like "no receipts"."""
+    debit = write_csv(tmp_path / "debit.csv", [("1", "A"), ("2", "B")])
+    receipts = write_csv(tmp_path / "receipts.csv", [("10", "A"), ("11", "B")])
+    out = tmp_path / "out" / "result.csv"
+    work = tmp_path / "work"
+    with pytest.raises(ej.IntegrityError, match="丢失"):
+        ej.reconcile(
+            debit, receipts, out, limit=2, work_root=work,
+            damage_buckets=ej.DAMAGE_MISSING_BUCKET,
+        )
+    # No partial result may be published or left behind, and no scratch files.
+    assert not out.exists()
+    assert not out.with_name(out.name + ".part").exists()
+    assert list(work.iterdir()) == []
+
+
+def test_truncated_bucket_with_whole_missing_row_fails_job(tmp_path):
+    """A tail that lost one or more complete receipts must not pass as a miss."""
+    debit = write_csv(tmp_path / "debit.csv", [("1", "A"), ("2", "B")])
+    receipts = write_csv(
+        tmp_path / "receipts.csv", [("10", "A"), ("11", "A"), ("12", "B")]
+    )
+    out = tmp_path / "out" / "result.csv"
+    work = tmp_path / "work"
+    with pytest.raises(ej.IntegrityError, match="截短|条数"):
+        ej.reconcile(
+            debit, receipts, out, limit=2, work_root=work,
+            damage_buckets=ej.DAMAGE_TRUNCATE_ROW,
+        )
+    assert not out.exists()
+    assert not out.with_name(out.name + ".part").exists()
+    assert list(work.iterdir()) == []
+
+
+def test_bucket_damaged_after_seal_and_never_probed_is_caught(tmp_path, monkeypatch):
+    """Final inventory check must catch a bucket lost before its debit is read.
+
+    The debit file is empty here, so nothing ever streams the bucket; only the
+    end-of-run inventory sweep can notice the loss.
+    """
+    debit = write_csv(tmp_path / "debit.csv", [])
+    receipts = write_csv(tmp_path / "receipts.csv", [("10", "UNPROBED")])
+    real_seal = ej._BucketStore.seal
+
+    def seal_and_damage(self):
+        real_seal(self)
+        ej._damage_buckets(self, ej.DAMAGE_MISSING_BUCKET)
+
+    monkeypatch.setattr(ej._BucketStore, "seal", seal_and_damage)
+    with pytest.raises(ej.IntegrityError, match="丢失"):
+        ej.reconcile(
+            debit, receipts, tmp_path / "r.csv", limit=2, work_root=tmp_path / "w"
+        )
+
+
+def test_truncation_after_seal_with_no_probe_is_caught(tmp_path, monkeypatch):
+    debit = write_csv(tmp_path / "debit.csv", [])
+    receipts = write_csv(tmp_path / "receipts.csv", [("10", "X"), ("11", "X")])
+    real_seal = ej._BucketStore.seal
+
+    def seal_and_truncate(self):
+        real_seal(self)
+        ej._damage_buckets(self, ej.DAMAGE_TRUNCATE_ROW)
+
+    monkeypatch.setattr(ej._BucketStore, "seal", seal_and_truncate)
+    with pytest.raises(ej.IntegrityError):
+        ej.reconcile(
+            debit, receipts, tmp_path / "r.csv", limit=2, work_root=tmp_path / "w"
+        )
+
+
+def test_unknown_damage_mode_is_rejected(tmp_path):
+    debit = write_csv(tmp_path / "debit.csv", [("1", "A")])
+    receipts = write_csv(tmp_path / "receipts.csv", [("10", "A")])
+    with pytest.raises(ValueError, match="未知"):
+        ej.reconcile(
+            debit, receipts, tmp_path / "r.csv", limit=2, work_root=tmp_path / "w",
+            damage_buckets="nonsense",
+        )
+
+
+def test_seal_uses_one_manifest_per_bucket_and_no_memory_index(tmp_path):
+    """Sealing must be disk-backed: one manifest file per bucket, no in-memory
+    transaction-id index.  Probes then verify against the manifests."""
+    receipts = [(str(i), f"T{i}") for i in range(1, 51)]
+    debit = write_csv(tmp_path / "debit.csv", [("1", "T1"), ("2", "MISS")])
+    rec = write_csv(tmp_path / "receipts.csv", receipts)
+    out = tmp_path / "out" / "result.csv"
+    stats = ej.reconcile(debit, rec, out, limit=2, work_root=tmp_path / "work")
+    assert stats.buckets_sealed == 50
+    assert stats.bucket_verifications == 1  # only T1 matched and was streamed
+    assert read_result(out) == [("1", "1"), ("2", "")]
+
+
+def test_normal_run_without_receipts_still_blanks_row_and_cleans(tmp_path):
+    out, stats, work = run(
+        [("1", "NOPE"), ("2", "A")], [("10", "A")], limit=2, tmp=tmp_path
+    )
+    assert read_result(out) == [("1", ""), ("2", "10")]
+    assert stats.unmatched_debits == 1
+    assert list(work.iterdir()) == []

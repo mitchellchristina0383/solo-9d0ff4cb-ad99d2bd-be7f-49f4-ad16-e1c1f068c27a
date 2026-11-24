@@ -14,6 +14,7 @@
   label { display: block; font-weight: 600; margin: .9rem 0 .3rem; }
   input[type=file] { display: block; }
   input[type=number] { width: 7rem; padding: .3rem .4rem; }
+  select { padding: .35rem .4rem; border-radius: 6px; }
   button { margin-top: 1.25rem; padding: .55rem 1.2rem; border-radius: 8px;
            border: 0; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
   button:disabled { opacity: .5; cursor: not-allowed; }
@@ -53,6 +54,14 @@
   <input id="fault_after_writes" name="fault_after_writes" type="number" min="0" step="1" placeholder="例如 3">
   <p class="hint">用于验证写入失败时的报错与中间文件清理。</p>
 
+  <label for="damage_buckets">分桶完整性故障注入（可选，验证缺桶/截断被拦下）</label>
+  <select id="damage_buckets" name="damage_buckets">
+    <option value="">不注入（正常）</option>
+    <option value="missing-bucket">丢失一个临时分桶文件</option>
+    <option value="truncate-row">从分桶尾部删掉一条完整回执</option>
+  </select>
+  <p class="hint">注入后作业必须失败；已写出的部分结果不可下载，页面会说明哪一类损坏。</p>
+
   <button id="submit-btn" type="submit">开始试跑</button>
   <p id="form-error" class="error" role="alert"></p>
 </form>
@@ -86,6 +95,8 @@ const STAT_LABELS = [
   ['empty_receipt_rows_skipped', '跳过的空交易号回执'],
   ['intermediate_files_created', '中间文件数'],
   ['intermediate_records_written', '中间记录数'],
+  ['buckets_sealed', '已封存分桶数'],
+  ['bucket_verifications', '校验过的分桶数'],
   ['output_rows', '结果行数'],
   ['matched_debits', '配到回执的扣款'],
   ['unmatched_debits', '无回执的扣款'],
@@ -177,6 +188,8 @@ $('run-form').addEventListener('submit', async (ev) => {
   body.append('buffer_limit', $('buffer_limit').value);
   const fault = $('fault_after_writes').value.trim();
   if (fault) body.append('fault_after_writes', fault);
+  const damage = $('damage_buckets').value;
+  if (damage) body.append('damage_buckets', damage);
 
   try {
     const res = await fetch('/api/jobs', {method: 'POST', body});

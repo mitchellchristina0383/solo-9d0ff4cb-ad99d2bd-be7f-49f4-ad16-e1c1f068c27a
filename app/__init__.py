@@ -54,7 +54,16 @@ def create_app(data_dir: Path | None = None, testing: bool = False) -> Flask:
             if fault_after < 0:
                 return jsonify(error="故障注入次数不能为负"), 400
 
-        job = manager.create_job(limit=limit, fault_after_writes=fault_after)
+        raw_damage = request.form.get("damage_buckets", "").strip()
+        if raw_damage and raw_damage not in external_join.DAMAGE_CHOICES:
+            return jsonify(error="未知的分桶故障注入模式"), 400
+        damage_buckets = raw_damage or None
+
+        job = manager.create_job(
+            limit=limit,
+            fault_after_writes=fault_after,
+            damage_buckets=damage_buckets,
+        )
         try:
             jobs.save_upload(debit, job.debit_path)
             jobs.save_upload(receipt, job.receipt_path)

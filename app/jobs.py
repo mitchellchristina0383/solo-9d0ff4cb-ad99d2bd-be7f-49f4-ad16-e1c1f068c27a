@@ -38,6 +38,7 @@ class Job:
     limit: int
     fault_after_writes: int | None
     root: Path
+    damage_buckets: str | None = None
     state: str = "queued"          # queued | running | done | failed
     error: str = ""
     stats: dict = field(default_factory=dict)
@@ -69,6 +70,7 @@ class Job:
                 "error": self.error,
                 "limit": self.limit,
                 "fault_after_writes": self.fault_after_writes,
+                "damage_buckets": self.damage_buckets,
                 "stats": dict(self.stats),
                 "created_at": self.created_at,
                 "finished_at": self.finished_at,
@@ -115,11 +117,22 @@ class JobManager:
             except OSError:
                 continue
 
-    def create_job(self, limit: int, fault_after_writes: int | None) -> Job:
+    def create_job(
+        self,
+        limit: int,
+        fault_after_writes: int | None,
+        damage_buckets: str | None = None,
+    ) -> Job:
         job_id = uuid.uuid4().hex
         root = self.jobs_dir / job_id
         (root / "work").mkdir(parents=True)
-        job = Job(job_id=job_id, limit=limit, fault_after_writes=fault_after_writes, root=root)
+        job = Job(
+            job_id=job_id,
+            limit=limit,
+            fault_after_writes=fault_after_writes,
+            root=root,
+            damage_buckets=damage_buckets,
+        )
         with self._lock:
             self._jobs[job_id] = job
         return job
@@ -158,6 +171,7 @@ class JobManager:
                 work_root=job.work_root,
                 progress=self._progress_writer(job),
                 fault_after_writes=job.fault_after_writes,
+                damage_buckets=job.damage_buckets,
             )
         except external_join.OperatorError as exc:
             self._fail(job, str(exc))

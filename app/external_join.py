@@ -27,6 +27,22 @@ directory that is removed in a ``finally`` block, also when a temporary-disk
 write fails.  The result CSV is written to a ``.part`` file next to its final
 name, flushed and fsynced, and only then atomically renamed -- so a download
 can never observe a partial result.
+
+Integrity of the spill store
+----------------------------
+A left join is only correct if every bucket is complete: a missing bucket or
+a bucket whose tail lost one or more whole receipts would silently turn a
+match into a blank ``receipt_row_no``.  After the receipt pass every bucket is
+sealed with a small manifest (row count, byte count and SHA-256) written to a
+separate ``manifest/`` tree keyed by the same hash.  The probe verifies every
+bucket it streams against its manifest, and a final sweep compares the live
+bucket tree against the sealed totals.  A bucket that is absent when its
+manifest says it must exist, or that is short/corrupt, therefore fails the
+job instead of producing a quietly wrong result.
+
+The manifest is one file per bucket on disk; nothing is indexed by
+transaction id in memory, so the cache bound and the "two sequential input
+passes" property are preserved.
 """
 
 from __future__ import annotations
@@ -62,6 +78,10 @@ class SpillWriteError(OperatorError):
     """A temporary/result file could not be written; workspace was cleaned."""
 
 
+class IntegrityError(OperatorError):
+    """A sealed spill bucket is missing or truncated; the join would be wrong."""
+
+
 class LimitError(OperatorError):
     """The configured cache limit is below the supported minimum."""
 
@@ -81,6 +101,8 @@ class RunStats:
     empty_receipt_rows_skipped: int = 0
     intermediate_files_created: int = 0
     intermediate_records_written: int = 0
+    buckets_sealed: int = 0
+    bucket_verifications: int = 0
     output_rows: int = 0
     matched_debits: int = 0
     unmatched_debits: int = 0
@@ -97,6 +119,8 @@ class RunStats:
             "empty_receipt_rows_skipped": self.empty_receipt_rows_skipped,
             "intermediate_files_created": self.intermediate_files_created,
             "intermediate_records_written": self.intermediate_records_written,
+            "buckets_sealed": self.buckets_sealed,
+            "bucket_verifications": self.bucket_verifications,
             "output_rows": self.output_rows,
             "matched_debits": self.matched_debits,
             "unmatched_debits": self.unmatched_debits,
@@ -144,6 +168,60 @@ class _FaultInjector:
             raise SpillWriteError(
                 f"模拟临时盘写入失败：第 {self.writes} 次写入被拒绝"
             )
+
+
+# Damage modes for the page's self-test hook.  After sealing, the operator
+# applies the requested damage to the spill store exactly as a careless
+# cleanup / truncated filesystem would, so the integrity check can be
+# exercised end to end.
+DAMAGE_MISSING_BUCKET = "missing-bucket"
+DAMAGE_TRUNCATE_ROW = "truncate-row"
+DAMAGE_CHOICES = (DAMAGE_MISSING_BUCKET, DAMAGE_TRUNCATE_ROW)
+
+
+def _damage_buckets(store: "_BucketStore", mode: str) -> None:
+    """Deliberately damage one sealed bucket to exercise the integrity checks.
+
+    * ``missing-bucket``: unlink the first bucket file found (as if it was
+      lost).
+    * ``truncate-row``: remove the last whole record from the first bucket
+      that holds at least two records (as if the tail lost a complete
+      receipt).
+
+    The scan is streaming and holds one bucket at a time, so this self-test
+    hook does not build a per-transaction list either.  Raises
+    :class:`IntegrityError` if no bucket is suitable, so a self-test that
+    cannot actually damage anything fails loudly instead of passing.
+    """
+    try:
+        with os.scandir(store.bucket_root) as shards:
+            for shard in shards:
+                if not shard.is_dir():
+                    continue
+                with os.scandir(shard.path) as buckets:
+                    for entry in buckets:
+                        if not entry.name.endswith(".bucket"):
+                            continue
+                        if mode == DAMAGE_MISSING_BUCKET:
+                            os.unlink(entry.path)
+                            return
+                        if mode == DAMAGE_TRUNCATE_ROW:
+                            with open(entry.path, "rb") as fh:
+                                data = fh.read()
+                            if data.count(b"\n") < 2:
+                                continue
+                            truncated = data.rsplit(b"\n", 2)[0] + b"\n"
+                            with open(entry.path, "wb") as fh:
+                                fh.write(truncated)
+                            return
+                        raise ValueError(f"未知的故障注入模式：{mode!r}")
+    except OSError as exc:
+        raise SpillWriteError(f"故障注入破坏临时分桶失败：{exc}") from exc
+    if mode == DAMAGE_MISSING_BUCKET:
+        raise IntegrityError("故障注入失败：没有可分桶可破坏")
+    if mode == DAMAGE_TRUNCATE_ROW:
+        raise IntegrityError("故障注入失败：没有包含至少两条回执的分桶可截断")
+    raise ValueError(f"未知的故障注入模式：{mode!r}")
 
 
 def _is_header(row: list[str]) -> bool:
@@ -234,10 +312,15 @@ def _encode_row(row_no: str, txn_id: str) -> bytes:
 def _decode_bucket_line(raw: bytes) -> "InputRecord | None":
     if not raw.strip():
         return None
-    text = raw.decode("utf-8")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise IntegrityError("临时分桶文件损坏：出现非法 UTF-8 字节（文件可能被截短）") from None
     row_no, sep, txn_id = text.partition("\t")
     if not sep:
-        raise SpillWriteError("临时分桶文件损坏：缺少字段分隔符")
+        raise IntegrityError(
+            "临时分桶文件损坏：某条回执缺少字段分隔符（文件可能被改写）"
+        )
     return InputRecord(row_no=_decode_field(row_no), txn_id=_decode_field(txn_id))
 
 
@@ -260,25 +343,77 @@ class _BucketStore:
     At most :data:`MAX_OPEN_BUCKETS` append handles are kept open (an LRU), so
     the number of distinct transaction ids does not exhaust file descriptors.
     Handles, unlike cached CSV rows, are bookkeeping.
+
+    After the receipt pass :meth:`seal` walks the bucket tree once and writes
+    a tiny manifest (record count, byte count, SHA-256) per bucket into a
+    parallel ``manifests/`` tree, plus constant-size per-shard totals.  A
+    probe of a sealed bucket verifies the bytes it streams against that
+    manifest, and :meth:`verify_inventory` re-checks the whole bucket tree at
+    the end.  Both keep O(1) state: nothing is indexed by transaction id in
+    memory.
     """
 
     def __init__(self, root: Path, stats: RunStats, fault: _FaultInjector):
         self.bucket_root = os.path.join(str(root), "buckets")
+        self.manifest_root = os.path.join(str(root), "manifests")
         try:
             os.makedirs(self.bucket_root, exist_ok=True)
+            os.makedirs(self.manifest_root, exist_ok=True)
             # Pre-create the fan-out directories so appending a fresh bucket
             # needs no directory creation syscall.
             for i in range(BUCKET_FANOUT):
-                os.makedirs(os.path.join(self.bucket_root, f"{i:02x}"), exist_ok=True)
+                shard = f"{i:02x}"
+                os.makedirs(os.path.join(self.bucket_root, shard), exist_ok=True)
+                os.makedirs(os.path.join(self.manifest_root, shard), exist_ok=True)
         except OSError as exc:
             raise SpillWriteError(f"无法创建临时分桶目录：{exc}") from exc
         self.stats = stats
         self.fault = fault
         self._handles: OrderedDict[str, int] = OrderedDict()
+        self.sealed = False
 
     def path_for(self, txn_id: str) -> str:
         name = _bucket_name(txn_id)
         return os.path.join(self.bucket_root, name[:2], name)
+
+    @staticmethod
+    def _manifest_name(bucket_name: str) -> str:
+        return bucket_name[: -len(".bucket")] + ".manifest"
+
+    def _manifest_path(self, bucket_name: str) -> str:
+        return os.path.join(
+            self.manifest_root, bucket_name[:2], self._manifest_name(bucket_name)
+        )
+
+    @staticmethod
+    def _parse_manifest(raw: bytes, where: str) -> tuple[int, int, str]:
+        try:
+            text = raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            raise IntegrityError(f"封存清单损坏（{where}）：不是合法 UTF-8") from None
+        parts = text.split()
+        if len(parts) != 3:
+            raise IntegrityError(f"封存清单损坏（{where}）：字段数不是 3")
+        try:
+            records, nbytes = int(parts[0]), int(parts[1])
+        except ValueError:
+            raise IntegrityError(f"封存清单损坏（{where}）：计数不是整数") from None
+        digest = parts[2]
+        if records < 0 or nbytes < 0 or len(digest) != 64:
+            raise IntegrityError(f"封存清单损坏（{where}）：取值非法")
+        return records, nbytes, digest
+
+    def _read_manifest(self, name: str) -> tuple[int, int, str] | None:
+        """Return the sealed (records, bytes, sha256) for a bucket, if sealed."""
+        path = self._manifest_path(name)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(256)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SpillWriteError(f"读取封存清单失败：{exc}") from exc
+        return self._parse_manifest(raw, name)
 
     def iter_bucket(self, txn_id: str, chunk_bytes: int = 256 * 1024) -> Iterator[InputRecord]:
         """Stream the bucket for ``txn_id``; yields nothing if it has none.
@@ -286,13 +421,33 @@ class _BucketStore:
         Only ``chunk_bytes`` of raw bytes is read at a time, so a bucket with
         more receipts than the configured limit is consumed in bounded space.
         Nothing is retained after the generator finishes.
+
+        The bucket is checked against its seal while streaming.  If the seal
+        says the bucket must exist but its file is gone, or the bytes read do
+        not match the sealed count/byte count/digest (e.g. the tail lost whole
+        receipts), :class:`IntegrityError` is raised instead of quietly
+        reporting "no receipts".
         """
+        name = _bucket_name(txn_id)
+        expected = self._read_manifest(name)
         try:
             fd = os.open(self.path_for(txn_id), os.O_RDONLY)
         except FileNotFoundError:
+            if expected is not None:
+                raise IntegrityError(
+                    f"临时分桶文件丢失：交易号 {txn_id!r} 的桶已封存但文件不存在"
+                ) from None
             return
         except OSError as exc:
             raise SpillWriteError(f"读取临时分桶文件失败：{exc}") from exc
+        if expected is None:
+            os.close(fd)
+            raise IntegrityError(
+                f"临时分桶文件未封存：交易号 {txn_id!r} 的桶存在但缺少封存清单"
+            )
+        hasher = hashlib.sha256()
+        total_bytes = 0
+        records = 0
         tail = b""
         try:
             while True:
@@ -302,11 +457,14 @@ class _BucketStore:
                     raise SpillWriteError(f"读取临时分桶文件失败：{exc}") from exc
                 if not block:
                     break
+                hasher.update(block)
+                total_bytes += len(block)
                 lines = (tail + block).split(b"\n")
                 tail = lines.pop()
                 for raw in lines:
                     rec = _decode_bucket_line(raw)
                     if rec is not None:
+                        records += 1
                         yield rec
         finally:
             try:
@@ -316,7 +474,16 @@ class _BucketStore:
         if tail:
             rec = _decode_bucket_line(tail)
             if rec is not None:
+                records += 1
                 yield rec
+        self.stats.bucket_verifications += 1
+        got = (records, total_bytes, hasher.hexdigest())
+        if got != expected:
+            raise IntegrityError(
+                "临时分桶文件被截短或损坏："
+                f"交易号 {txn_id!r} 封存为 {expected[0]} 条/{expected[1]} 字节，"
+                f"实际读到 {records} 条/{total_bytes} 字节"
+            )
 
     def _close_entry(self, name: str) -> None:
         fd = self._handles.pop(name)
@@ -359,6 +526,116 @@ class _BucketStore:
         for _dirpath, _dirs, files in os.walk(self.bucket_root):
             total += len(files)
         return total
+
+    def seal(self) -> None:
+        """Seal every bucket with a manifest.
+
+        Called once after the receipt pass and before any probing.  Walking
+        the bucket tree touches every bucket sequentially; the retained state
+        is one manifest file per bucket on disk, never a map from transaction
+        id to anything in memory.
+        """
+        self.close_all()
+        try:
+            with os.scandir(self.bucket_root) as shards:
+                for shard_entry in shards:
+                    if not shard_entry.is_dir():
+                        continue
+                    with os.scandir(shard_entry.path) as buckets:
+                        for bucket_entry in buckets:
+                            name = bucket_entry.name
+                            if not name.endswith(".bucket"):
+                                continue
+                            records, nbytes, digest = self._digest_bucket(
+                                bucket_entry.path
+                            )
+                            self._write_manifest(name, records, nbytes, digest)
+                            self.stats.buckets_sealed += 1
+        except OSError as exc:
+            raise SpillWriteError(f"封存临时分桶文件失败：{exc}") from exc
+        self.sealed = True
+
+    def _digest_bucket(self, path: str) -> tuple[int, int, str]:
+        hasher = hashlib.sha256()
+        records = 0
+        nbytes = 0
+        try:
+            with open(path, "rb") as fh:
+                while True:
+                    block = fh.read(1024 * 1024)
+                    if not block:
+                        break
+                    hasher.update(block)
+                    nbytes += len(block)
+                    # Every bucket record is one newline-terminated line, so a
+                    # newline count cannot be fooled by a chunk boundary.
+                    records += block.count(b"\n")
+        except OSError as exc:
+            raise SpillWriteError(f"读取临时分桶文件失败：{exc}") from exc
+        return records, nbytes, hasher.hexdigest()
+
+    def _write_manifest(
+        self, bucket_name: str, records: int, nbytes: int, digest: str
+    ) -> None:
+        content = f"{records} {nbytes} {digest}\n".encode("ascii")
+        self.fault.tick()
+        try:
+            fd = os.open(
+                self._manifest_path(bucket_name),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                _write_all(fd, content)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise SpillWriteError(f"写入封存清单失败：{exc}") from exc
+
+    def verify_inventory(self) -> None:
+        """Re-check the live bucket tree against the sealed manifests.
+
+        Catches a bucket that disappeared or was truncated after sealing but
+        was never probed by a debit (for which a plain "no receipts" answer
+        would have been wrong).  Every live bucket must still have a seal and
+        its on-disk size must equal the sealed byte count; the number of live
+        buckets must equal the number sealed.  A bucket that was probed has
+        already been checked byte-for-byte (including its SHA-256) while
+        streaming, so this sweep only needs ``stat`` per bucket -- cheap and
+        still constant-memory.
+        """
+        if not self.sealed:
+            raise IntegrityError("内部错误：未封存即清点分桶")
+        seen = 0
+        try:
+            with os.scandir(self.bucket_root) as shards:
+                for shard_entry in shards:
+                    if not shard_entry.is_dir():
+                        continue
+                    with os.scandir(shard_entry.path) as buckets:
+                        for bucket_entry in buckets:
+                            name = bucket_entry.name
+                            if not name.endswith(".bucket"):
+                                continue
+                            expected = self._read_manifest(name)
+                            if expected is None:
+                                raise IntegrityError(
+                                    f"临时分桶文件未封存：{name} 存在但缺少封存清单"
+                                )
+                            size = bucket_entry.stat().st_size
+                            if size != expected[1]:
+                                raise IntegrityError(
+                                    "临时分桶文件被截短："
+                                    f"{name} 封存 {expected[1]} 字节，现有 {size} 字节"
+                                )
+                            seen += 1
+            if seen != self.stats.buckets_sealed:
+                raise IntegrityError(
+                    "临时分桶文件丢失："
+                    f"封存 {self.stats.buckets_sealed} 个，清点到 {seen} 个"
+                )
+        except OSError as exc:
+            raise SpillWriteError(f"清点临时分桶文件失败：{exc}") from exc
 
     def close_all(self) -> None:
         while self._handles:
@@ -411,12 +688,17 @@ def reconcile(
     work_root: Path,
     progress: Callable[[dict], None] | None = None,
     fault_after_writes: int | None = None,
+    damage_buckets: str | None = None,
 ) -> RunStats:
     """Run the external left join and return statistics.
 
     ``debit_path`` and ``receipt_path`` are each read exactly once,
     sequentially.  ``output_path`` only appears once complete.  On any
     failure all intermediate files (and any partial result) are removed.
+
+    ``damage_buckets`` is a self-test hook (see :data:`DAMAGE_CHOICES`): after
+    sealing, the named damage is applied to a bucket so the integrity check
+    can be demonstrated from the page.  It is not used on the normal path.
     """
     debit_path = Path(debit_path)
     receipt_path = Path(receipt_path)
@@ -425,6 +707,8 @@ def reconcile(
 
     if limit < MIN_BUFFER_LIMIT:
         raise LimitError(f"缓存上限至少为 {MIN_BUFFER_LIMIT} 条，收到 {limit}")
+    if damage_buckets is not None and damage_buckets not in DAMAGE_CHOICES:
+        raise ValueError(f"未知的故障注入模式：{damage_buckets!r}")
     if not debit_path.is_file():
         raise InputError("扣款 CSV 不存在")
     if not receipt_path.is_file():
@@ -473,6 +757,12 @@ def reconcile(
                 emit("receipts")
         store.close_all()
         stats.intermediate_files_created = store.count_files()
+        # Seal every bucket: from here on a missing or short bucket is a hard
+        # failure, never a silent "this debit had no receipt".  The seal walk
+        # is disk-only; it retains no per-transaction state.
+        store.seal()
+        if damage_buckets is not None:
+            _damage_buckets(store, damage_buckets)
         emit("debits", force=True)
 
         # ---- Pass 2 over debits: stream the matching bucket ---------------
@@ -524,6 +814,12 @@ def reconcile(
                     budget.release(1)
                 if stats.debit_rows_read % 2000 == 0:
                     emit("debits")
+            # Every debit has been probed.  Re-check the whole bucket tree
+            # against the seal before publishing: a bucket that vanished or
+            # was truncated after sealing would otherwise have produced a
+            # false "unmatched" row (or a short match list) for its debit.
+            emit("verifying", force=True)
+            store.verify_inventory()
             try:
                 out_fh.flush()
                 os.fsync(out_fh.fileno())
